@@ -9,8 +9,16 @@ import { Database } from "bun:sqlite";
  */
 export function openDatabase(path: string): Database {
   const db = new Database(path, { create: true });
-  // WAL improves concurrent read/write behaviour for the local server.
-  db.exec("PRAGMA journal_mode = WAL;");
+  // WAL improves concurrent read/write behaviour for the local server, but it
+  // needs a shared-memory (`-shm`) file that some filesystems can't provide
+  // (network mounts, iCloud/Dropbox-synced folders…), where it fails with
+  // SQLITE_IOERR_SHMOPEN. Treat it as best-effort: on failure, keep the default
+  // rollback journal so the app still runs.
+  try {
+    db.exec("PRAGMA journal_mode = WAL;");
+  } catch {
+    // Filesystem doesn't support WAL shared memory — fall back silently.
+  }
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
   return db;
