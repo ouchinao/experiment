@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 /**
  * Opens a SQLite database and applies the schema.
@@ -8,18 +10,38 @@ import { Database } from "bun:sqlite";
  * ":memory:" for an ephemeral database (used by integration tests).
  */
 export function openDatabase(path: string): Database {
-  const db = new Database(path, { create: true });
-  // WAL improves concurrent read/write behaviour for the local server, but it
-  // needs a shared-memory (`-shm`) file that some filesystems can't provide
-  // (network mounts, iCloud/Dropbox-synced folders…), where it fails with
-  // SQLITE_IOERR_SHMOPEN. Treat it as best-effort: on failure, keep the default
-  // rollback journal so the app still runs.
-  try {
-    db.exec("PRAGMA journal_mode = WAL;");
-  } catch {
-    // Filesystem doesn't support WAL shared memory — fall back silently.
+  // Resolve to an absolute path and make sure the parent directory exists — a
+  // missing directory is a common cause of SQLITE_CANTOPEN, and resolving means
+  // it doesn't depend on the process's current working directory.
+  const dbPath = path === ":memory:" ? path : resolve(path);
+  if (dbPath !== ":memory:") {
+    mkdirSync(dirname(dbPath), { recursive: true });
   }
-  db.exec("PRAGMA foreign_keys = ON;");
+
+  let db: Database;
+  try {
+    db = new Database(dbPath, { create: true });
+    // WAL improves concurrent read/write behaviour for the local server, but it
+    // needs a shared-memory (`-shm`) file that some filesystems can't provide
+    // (network mounts, iCloud/Dropbox-synced folders…), where it fails with
+    // SQLITE_IOERR_SHMOPEN. Treat it as best-effort: on failure, keep the
+    // default rollback journal so the app still runs.
+    try {
+      db.exec("PRAGMA journal_mode = WAL;");
+    } catch {
+      // Filesystem doesn't support WAL shared memory — fall back silently.
+    }
+    db.exec("PRAGMA foreign_keys = ON;");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Could not open the SQLite database at "${dbPath}": ${detail}. ` +
+        "Make sure the location is writable and not on a synced or network " +
+        "folder (iCloud/Dropbox/SMB). Set DATABASE_PATH to a local path, e.g. " +
+        'DATABASE_PATH="$HOME/.kakeibo/kakeibo.sqlite".',
+    );
+  }
+
   migrate(db);
   return db;
 }
