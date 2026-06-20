@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+
+/** How many startup backups of the database file to retain. */
+const BACKUP_LIMIT = 10;
 
 /**
  * Opens a SQLite database and applies the schema.
@@ -8,6 +11,13 @@ import { dirname, resolve } from "node:path";
  * Bun ships an embedded SQLite engine (`bun:sqlite`), so persistence needs no
  * external service — a perfect fit for this privacy-first, offline app. Pass
  * ":memory:" for an ephemeral database (used by integration tests).
+ *
+ * Durability choices for a single-user local app:
+ *  - the **rollback journal** (not WAL) is used, so every commit lands directly
+ *    in the main file — there is no separate `-wal` that could be deleted or
+ *    stranded (e.g. on a full disk), and no WAL `-shm` file to fail on;
+ *  - the existing file is snapshotted into a rotating `backups/` directory on
+ *    open, so a mishap can be recovered from a recent copy.
  */
 export function openDatabase(path: string): Database {
   // Resolve to an absolute path and make sure the parent directory exists — a
@@ -16,34 +26,69 @@ export function openDatabase(path: string): Database {
   const dbPath = path === ":memory:" ? path : resolve(path);
   if (dbPath !== ":memory:") {
     mkdirSync(dirname(dbPath), { recursive: true });
+    backUpExisting(dbPath);
   }
 
   let db: Database;
   try {
     db = new Database(dbPath, { create: true });
-    // WAL improves concurrent read/write behaviour for the local server, but it
-    // needs a shared-memory (`-shm`) file that some filesystems can't provide
-    // (network mounts, iCloud/Dropbox-synced folders…), where it fails with
-    // SQLITE_IOERR_SHMOPEN. Treat it as best-effort: on failure, keep the
-    // default rollback journal so the app still runs.
-    try {
-      db.exec("PRAGMA journal_mode = WAL;");
-    } catch {
-      // Filesystem doesn't support WAL shared memory — fall back silently.
-    }
+    // Rollback journal: durable per-commit writes to the main file, and it
+    // converts an existing WAL database back (also avoids SQLITE_IOERR_SHMOPEN).
+    db.exec("PRAGMA journal_mode = DELETE;");
     db.exec("PRAGMA foreign_keys = ON;");
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(
       `Could not open the SQLite database at "${dbPath}": ${detail}. ` +
-        "Make sure the location is writable and not on a synced or network " +
-        "folder (iCloud/Dropbox/SMB). Set DATABASE_PATH to a local path, e.g. " +
-        'DATABASE_PATH="$HOME/.kakeibo/kakeibo.sqlite".',
+        "Check the location is writable, has free disk space, and isn't on a " +
+        "synced or network folder (iCloud/Dropbox/SMB). Set DATABASE_PATH to a " +
+        'local path, e.g. DATABASE_PATH="$HOME/.kakeibo/kakeibo.sqlite".',
     );
   }
 
   migrate(db);
   return db;
+}
+
+/**
+ * Copies the current database file into a sibling `backups/` directory before it
+ * is opened, keeping the most recent {@link BACKUP_LIMIT}. Best-effort: an
+ * unchanged database is not re-copied, and any failure (e.g. no disk space)
+ * must never stop the app from starting.
+ */
+function backUpExisting(dbPath: string): void {
+  try {
+    if (!existsSync(dbPath)) return;
+    const dir = join(dirname(dbPath), "backups");
+    mkdirSync(dir, { recursive: true });
+    const name = basename(dbPath);
+    const existing = readdirSync(dir)
+      .filter((f) => f.startsWith(`${name}.`) && f.endsWith(".bak"))
+      .sort();
+
+    const latest = existing.at(-1);
+    if (latest && filesEqual(dbPath, join(dir, latest))) return; // nothing changed
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    copyFileSync(dbPath, join(dir, `${name}.${stamp}.bak`));
+
+    // Drop everything but the newest BACKUP_LIMIT copies.
+    const all = [...existing, `${name}.${stamp}.bak`].sort();
+    for (const old of all.slice(0, Math.max(0, all.length - BACKUP_LIMIT))) {
+      rmSync(join(dir, old), { force: true });
+    }
+  } catch {
+    // Backups are best-effort; never block startup on them.
+  }
+}
+
+/** Byte-compares two files; false if either can't be read. */
+function filesEqual(a: string, b: string): boolean {
+  try {
+    return readFileSync(a).equals(readFileSync(b));
+  } catch {
+    return false;
+  }
 }
 
 /** Creates the schema if it does not already exist (idempotent). */
